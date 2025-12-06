@@ -5,16 +5,26 @@ const admin = require("firebase-admin");
 require("dotenv").config();
 const app = express();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-
 const stripe = require("stripe")(process.env.STRIPE_SECRET);
-
 const port = process.env.PORT || 3000;
 
-const serviceAccount = require("./zap-shift-firebase-adminsdk.json");
+// const serviceAccount = require("./zap-shift-firebase-adminsdk.json");
+
+// const serviceAccount = require("./firebase-admin-key.json");
+
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
+  "utf8"
+);
+const serviceAccount = JSON.parse(decoded);
+
 const e = require("express");
+const { count } = require("console");
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
+
+
+
 
 function generateTrackingId() {
   const prefix = "PRCL";
@@ -68,7 +78,7 @@ const verifyToken = async (req, res, next) => {
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
+    // await client.connect();
 
     const db = client.db("zap_shift_db");
     const userCollection = db.collection("users");
@@ -85,6 +95,18 @@ async function run() {
       const user = await userCollection.findOne(query);
 
       if (!user || user.role !== "admin") {
+        return res.status(403).send({ message: "forbidden access." });
+      }
+      next();
+    };
+
+    // verify rider
+    const verifyRider = async (req, res, next) => {
+      const email = req.decoded_email;
+      const query = { email: email };
+      const user = await userCollection.findOne(query);
+
+      if (!user || user.role !== "rider") {
         return res.status(403).send({ message: "forbidden access." });
       }
       next();
@@ -159,7 +181,7 @@ async function run() {
       res.send(result);
     });
 
-    // parcel api
+    // parcel related api
     app.get("/parcels", async (req, res) => {
       const query = {};
       const { email, deliveryStatus } = req.query;
@@ -176,6 +198,21 @@ async function run() {
 
       const cursor = parcelsCollection.find(query, options);
       const result = await cursor.toArray();
+      res.send(result);
+    });
+
+    // aggregate
+    app.get("/parcels/delivery-status/stats", async (req, res) => {
+      const pipeline = [
+        {
+          $group: {
+            _id: "$deliveryStatus",
+            count: { $sum: 1 },
+          },
+        },
+      ];
+
+      const result = await parcelsCollection.aggregate(pipeline).toArray();
       res.send(result);
     });
 
@@ -300,8 +337,8 @@ async function run() {
     // payment related apis
     // create payment sessions
     app.post("/payment-checkout-session", async (req, res) => {
-      const paymentInfo = req.body;
-      const amount = parseInt(paymentInfo.cost) * 100;
+      const parcelInfo = req.body;
+      const amount = parseInt(parcelInfo.cost) * 100;
       const session = await stripe.checkout.sessions.create({
         line_items: [
           {
@@ -310,7 +347,7 @@ async function run() {
               currency: "USD",
               unit_amount: amount,
               product_data: {
-                name: `Payment for ${paymentInfo.parcelName}`,
+                name: `Payment for ${parcelInfo.parcelName}`,
               },
             },
             quantity: 1,
@@ -318,11 +355,11 @@ async function run() {
         ],
         mode: "payment",
         metadata: {
-          parcelId: paymentInfo.parcelId,
-          parcelName: paymentInfo.parcelName,
-          trackingId: paymentInfo.trackingId,
+          parcelId: parcelInfo.parcelId,
+          parcelName: parcelInfo.parcelName,
+          trackingId: parcelInfo.trackingId,
         },
-        customer_email: paymentInfo.senderEmail,
+        customer_email: parcelInfo.senderEmail,
         success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
       });
@@ -406,22 +443,22 @@ async function run() {
           trackingId: trackingId,
         };
 
-        if (session.payment_status === "paid") {
-          const resultPayment = await paymentCollection.insertOne(payment);
+        // if (session.payment_status === "paid") {
+        const resultPayment = await paymentCollection.insertOne(payment);
 
-          logTracking(trackingId, "parcel_paid");
+        logTracking(trackingId, "parcel_paid");
 
-          res.send({
-            success: true,
-            modifyParcel: result,
-            trackingId: trackingId,
-            transactionId: session.payment_intent,
-            paymentInfo: resultPayment,
-          });
-        }
+        return res.send({
+          success: true,
+          modifyParcel: result,
+          trackingId: trackingId,
+          transactionId: session.payment_intent,
+          paymentInfo: resultPayment,
+        });
+        // }
       }
 
-      res.send({ success: false });
+      return res.send({ success: false });
     });
 
     // payment history
@@ -443,7 +480,6 @@ async function run() {
     });
 
     // rider related APIs
-
     app.get("/riders", async (req, res) => {
       const { status, district, workStatus } = req.query;
 
@@ -460,6 +496,53 @@ async function run() {
 
       const cursor = ridersCollection.find(query);
       const result = await cursor.toArray();
+      res.send(result);
+    });
+
+    // rider aggregate
+    app.get("/riders/delivery-per-day", async (req, res) => {
+      const { email } = req.query;
+      const pipeline = [
+        {
+          $match: {
+            riderEmail: email,
+            deliveryStatus: "parcel_delivered",
+          },
+        },
+        {
+          $lookup: {
+            from: "trackings",
+            localField: "trackingId",
+            foreignField: "trackingId",
+            as: "parcel_trackings",
+          },
+        },
+        {
+          $unwind: "$parcel_trackings",
+        },
+        {
+          $match: {
+            "parcel_trackings.status": "parcel_delivered",
+          },
+        },
+        {
+          $addFields: {
+            DeliveryDay: {
+              $dateToString: {
+                format: "%d-%m-%Y",
+                date: "$parcel_trackings.createdAt",
+              },
+            },
+          },
+        },
+        {
+          $group: {
+            _id: "$DeliveryDay",
+            deliveryCount: { $sum: 1 },
+          },
+        },
+      ];
+      const result = await parcelsCollection.aggregate(pipeline).toArray();
       res.send(result);
     });
 
@@ -518,10 +601,10 @@ async function run() {
     });
 
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
-    );
+    // await client.db("admin").command({ ping: 1 });
+    // console.log(
+    //   "Pinged your deployment. You successfully connected to MongoDB!"
+    // );
   } finally {
     // Ensures that the client will close when you finish/error
     // await client.close();
